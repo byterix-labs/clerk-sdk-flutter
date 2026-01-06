@@ -80,13 +80,17 @@ class _ClerkSignInPanelState extends State<ClerkSignInPanel>
           redirectUrl: redirectUri?.toString(),
         );
 
-        if (authState.client.signIn?.factors case List<clerk.Factor> factors
-            when mounted && factors.any((f) => f.strategy.isEnterpriseSSO)) {
-          await authState.ssoSignIn(
-            context,
-            clerk.Strategy.enterpriseSSO,
-            identifier: _identifier.orNullIfEmpty,
-          );
+        if (authState.client.signIn case clerk.SignIn signIn when mounted) {
+          final factors = signIn.factors;
+          if (factors.any((f) => f.strategy.isEnterpriseSSO)) {
+            await authState.ssoSignIn(
+              context,
+              clerk.Strategy.enterpriseSSO,
+              identifier: _identifier.orNullIfEmpty,
+            );
+          } else if (signIn.needsSecondFactor && factors.length == 1) {
+            await authState.attemptSignIn(strategy: factors.first.strategy);
+          }
         }
       },
       onError: _onError,
@@ -101,6 +105,7 @@ class _ClerkSignInPanelState extends State<ClerkSignInPanel>
 
   bool _requiresContinue(clerk.SignIn signIn) =>
       signIn.status.isUnknown ||
+      _strategy.mightAccept(_code) ||
       (signIn.verification == null &&
           signIn.canUsePassword &&
           _strategy != clerk.Strategy.emailLink);
@@ -117,12 +122,21 @@ class _ClerkSignInPanelState extends State<ClerkSignInPanel>
     final l10ns = authState.localizationsOf(context);
     final canResetPassword =
         env.config.firstFactors.any((f) => f.isPasswordResetter);
+    final firstFactors = signIn.factorsFor(clerk.Stage.first);
+    final secondFactors = signIn.factorsFor(clerk.Stage.second);
+
+    if (signIn.needsSecondFactor && secondFactors.length == 1) {
+      _strategy = secondFactors.first.strategy;
+    }
+
+    _strategy = signIn.verification?.strategy ?? _strategy;
 
     final themeExtension = ClerkAuth.themeExtensionOf(context);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: [
+        // Identifier input
         Openable(
           open: signIn.status.isUnknown,
           child: Column(
@@ -149,14 +163,22 @@ class _ClerkSignInPanelState extends State<ClerkSignInPanel>
             ],
           ),
         ),
+
+        // Identifier
         Openable(
           open: signIn.status.needsFactor,
-          child: Text(_identifier, style: themeExtension.styles.heading),
+          child: Text(
+            signIn.needsSecondFactor ? l10ns.twoStepVerification : _identifier,
+            style: themeExtension.styles.heading,
+          ),
         ),
         verticalMargin8,
+
+        // Email link message
         Openable(
           key: const Key('emailLinkMessage'),
-          open: _strategy == clerk.Strategy.emailLink,
+          open:
+              _strategy == clerk.Strategy.emailLink && signIn.needsFirstFactor,
           child: Column(
             children: [
               Text(
@@ -167,45 +189,80 @@ class _ClerkSignInPanelState extends State<ClerkSignInPanel>
               ),
               verticalMargin16,
               defaultLoadingWidget,
+              verticalMargin16,
             ],
           ),
         ),
+
+        // Code input
         Openable(
-          open: signIn.verification?.strategy.requiresCode == true,
+          key: const Key('code'),
+          open: _strategy.requiresCode,
           child: Padding(
             padding: verticalPadding8,
             child: ClerkCodeInput(
-              key: const Key('code'),
-              title: _identifier.isNotEmpty
-                  ? l10ns.enterTheCodeSentTo(_identifier)
-                  : l10ns.enterTheCodeSentToYou,
+              title: switch (_strategy) {
+                clerk.Strategy.emailCode ||
+                clerk.Strategy.resetPasswordEmailCode =>
+                  l10ns.enterTheCodeSentToYouByEmail,
+                clerk.Strategy.phoneCode ||
+                clerk.Strategy.resetPasswordPhoneCode =>
+                  l10ns.enterTheCodeSentToYouByTextMessage,
+                clerk.Strategy.backupCode => l10ns.enterOneOfYourBackupCodes,
+                clerk.Strategy.totp =>
+                  l10ns.enterTheCodeFromYourAuthenticatorApp,
+                _ => null,
+              },
+              onChanged: (code) => setState(() => _code = code),
               onSubmit: (code) async {
-                await _continue(
-                  authState,
-                  code: code,
-                  strategy: signIn.verification!.strategy,
-                );
+                await _continue(authState, code: code);
+                _strategy = clerk.Strategy.unknown;
                 return false;
               },
+              isTextual: _strategy.requiresTextualCode,
             ),
           ),
         ),
-        for (final stage in clerk.Stage.values) //
-          if (signIn.factorsFor(stage) case final factors
-              when factors.isNotEmpty) //
-            Openable(
-              key: ValueKey<clerk.Stage>(stage),
-              open: signIn.hasVerification == false &&
-                  _strategy != clerk.Strategy.emailLink &&
-                  signIn.status.needsFactorFor(stage),
-              child: _FactorList(
-                factors: factors,
-                onPasswordChanged: (password) => _password = password,
-                onSubmit: (strategy) =>
-                    _continue(authState, strategy: strategy),
-              ),
+
+        // First factors
+        if (firstFactors.isNotEmpty) //
+          Openable(
+            key: const ValueKey<clerk.Stage>(clerk.Stage.first),
+            open: signIn.needsFirstFactor && _strategy.isPassword,
+            child: Column(
+              children: [
+                _FactorList(
+                  factors: firstFactors,
+                  onPasswordChanged: (password) => _password = password,
+                  onSubmit: (strategy) =>
+                      _continue(authState, strategy: strategy),
+                ),
+                verticalMargin16,
+              ],
             ),
-        verticalMargin16,
+          ),
+
+        // Second factors
+        if (secondFactors.length > 1) //
+          Openable(
+            key: const ValueKey<clerk.Stage>(clerk.Stage.second),
+            open: signIn.needsSecondFactor && _strategy.requiresCode == false,
+            child: Column(
+              children: [
+                _FactorList(
+                  factors: secondFactors,
+                  stage: clerk.Stage.second,
+                  onSubmit: (strategy) =>
+                      _continue(authState, strategy: strategy),
+                ),
+                verticalMargin16,
+              ],
+            ),
+          ),
+
+        verticalMargin8,
+
+        // Buttons
         Row(
           children: [
             if (_requiresBack(signIn)) //
@@ -252,15 +309,18 @@ class _ClerkSignInPanelState extends State<ClerkSignInPanel>
 class _FactorList extends StatelessWidget {
   const _FactorList({
     required this.factors,
-    required this.onPasswordChanged,
+    this.onPasswordChanged,
     required this.onSubmit,
+    this.stage = clerk.Stage.first,
   });
 
   final List<clerk.Factor> factors;
 
-  final ValueChanged<String> onPasswordChanged;
+  final ValueChanged<String>? onPasswordChanged;
 
   final ValueChanged<clerk.Strategy> onSubmit;
+
+  final clerk.Stage stage;
 
   @override
   Widget build(BuildContext context) {
@@ -271,7 +331,7 @@ class _FactorList extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        if (hasPassword) //
+        if (onPasswordChanged case final onPasswordChanged? when hasPassword) //
           Padding(
             padding: topPadding8 + bottomPadding2,
             child: ClerkTextFormField(
@@ -290,6 +350,8 @@ class _FactorList extends StatelessWidget {
               child: StrategyButton(
                 key: ValueKey<clerk.Factor>(factor),
                 strategy: factor.strategy,
+                safeIdentifier: factor.safeIdentifier,
+                stage: stage,
                 onClick: () => onSubmit(factor.strategy),
               ),
             ),
