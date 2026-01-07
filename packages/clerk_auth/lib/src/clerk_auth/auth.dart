@@ -589,7 +589,9 @@ class Auth {
             .then(_housekeeping);
 
       case SignIn signIn
-          when signIn.status.needsFactor && strategy.mightAccept(code):
+          when signIn.status.needsFactor &&
+              (strategy.mightAccept(code) ||
+                  signIn.requiresPreparationFor(strategy)):
         final stage = Stage.forStatus(signIn.status);
         if (signIn.requiresPreparationFor(strategy)) {
           await _api
@@ -597,7 +599,8 @@ class Auth {
               .then(_housekeeping);
         }
         if (client.signIn case SignIn signIn
-            when signIn.requiresPreparationFor(strategy) == false) {
+            when signIn.requiresPreparationFor(strategy) == false &&
+                strategy.mightAccept(code)) {
           await _api
               .attemptSignIn(
                 signIn,
